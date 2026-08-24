@@ -1,13 +1,14 @@
-import io
+import os
+import tempfile
 import joblib
 import librosa
 import numpy as np
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 app = FastAPI(title="Smart Cradle Audio Processor")
 
-# Allow your web dashboard to communicate with this API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,13 +16,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load trained ML model
+# Load the trained ML model
 model = joblib.load("smart_cradle_model.pkl")
 
 
-def extract_features_from_audio(file_bytes):
-    # Load audio directly from memory buffer
-    audio, sr = librosa.load(io.BytesIO(file_bytes), sr=22050, duration=5.0)
+# Serve the web dashboard directly from root URL
+@app.get("/")
+async def serve_dashboard():
+    return FileResponse("index.html")
+
+
+def extract_features(file_path):
+    # Load audio and extract 40 MFCC features
+    audio, sr = librosa.load(file_path, sr=22050, duration=5.0)
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=40)
     mfcc_mean = np.mean(mfcc.T, axis=0)
     return mfcc_mean.reshape(1, -1)
@@ -29,24 +36,34 @@ def extract_features_from_audio(file_bytes):
 
 @app.post("/predict")
 async def predict_cry(file: UploadFile = File(...)):
-    audio_bytes = await file.read()
+    temp_path = None
+    try:
+        suffix = os.path.splitext(file.filename)[-1] or ".webm"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+            temp_audio.write(await file.read())
+            temp_path = temp_audio.name
 
-    # Extract MFCCs
-    features = extract_features_from_audio(audio_bytes)
+        features = extract_features(temp_path)
 
-    # Run ML inference
-    prediction = model.predict(features)[0]
-    probabilities = model.predict_proba(features)[0]
-    confidence = float(np.max(probabilities)) * 100
+        prediction = model.predict(features)[0]
+        probabilities = model.predict_proba(features)[0]
+        confidence = float(np.max(probabilities)) * 100
 
-    return {
-        "status": "success",
-        "detected_cry": prediction,
-        "confidence": round(confidence, 2),
-    }
+        return {
+            "status": "success",
+            "detected_cry": prediction,
+            "confidence": round(confidence, 2),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
